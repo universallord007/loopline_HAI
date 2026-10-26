@@ -1,11 +1,12 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { randomBytes, scryptSync, timingSafeEqual, createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const rooms = new Map();
+const users = new Map();
 const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const eras = ["PAST", "NOW", "FUTURE"];
 const verbs = ["SPLICE", "LIFT", "ANCHOR", "DECOY", "BOOST"];
@@ -384,6 +385,19 @@ function publicRoom(room, token) {
   };
 }
 function nowMs() { return Date.now(); }
+const hashToken = (token) => createHash("sha256").update(String(token)).digest("hex");
+function accountForRequest(request) {
+  const header = request.headers?.authorization || request.headers?.Authorization || "";
+  const token = String(header).match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) return null;
+  const digest = hashToken(token);
+  for (const user of users.values()) {
+    if (user.sessionHash === digest && user.sessionExpires > Date.now()) return user;
+  }
+  return null;
+}
+function safeAccount(user) { return { id: user.id, username: user.username, displayName: user.displayName }; }
+function passwordDigest(password, salt) { return scryptSync(password, salt, 64).toString("hex"); }
 async function readBody(request) {
   let raw = "";
   for await (const chunk of request) raw += chunk;
@@ -396,6 +410,7 @@ function sendJson(response, status, data) {
 }
 function touch(room, player) {
   player.seen = Date.now();
+  room.lastActivity = player.seen;
   if (room.hostId === player.id) room.hostSeen = player.seen;
 }
 function createPlayer(name, host = false) {
@@ -438,13 +453,57 @@ async function handleRequest(request, response) {
       response.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
       return response.end(await readFile(path.join(root, "loopline.js")));
     }
+    if (url.pathname === "/api/signup" && request.method === "POST") {
+      const data = await readBody(request);
+      const username = String(data.username || "").trim().toLowerCase();
+      const password = String(data.password || "");
+      if (!/^[a-z0-9_]{3,16}$/.test(username)) return sendJson(response, 400, { error: "Username must be 3–16 letters, numbers, or underscores." });
+      if (password.length < 8 || password.length > 128) return sendJson(response, 400, { error: "Password must be 8–128 characters." });
+      if (users.has(username)) return sendJson(response, 409, { error: "That username is already taken. Sign in or choose another." });
+      const salt = randomBytes(16).toString("hex");
+      const authToken = randomBytes(32).toString("base64url");
+      const user = { id: id(12), username, displayName: cleanName(String(data.username || "")), salt, passwordHash: passwordDigest(password, salt), sessionHash: hashToken(authToken), sessionExpires: Date.now() + 30 * 86400000, failedAttempts: 0, lockedUntil: 0 };
+      users.set(username, user);
+      return sendJson(response, 201, { authToken, account: safeAccount(user) });
+    }
+    if (url.pathname === "/api/login" && request.method === "POST") {
+      const data = await readBody(request);
+      const username = String(data.username || "").trim().toLowerCase();
+      const password = String(data.password || "");
+      const user = users.get(username);
+      if (user?.lockedUntil > Date.now()) return sendJson(response, 429, { error: "Too many sign-in tries. Wait 2 minutes and try again." });
+      const digest = user && password.length <= 128 ? passwordDigest(password, user.salt) : "";
+      const candidate = Buffer.from(digest || "0".repeat(128), "hex");
+      const expected = Buffer.from(user?.passwordHash || "0".repeat(128), "hex");
+      const ok = !!user && password.length <= 128 && timingSafeEqual(candidate, expected);
+      if (!ok) {
+        if (user) { user.failedAttempts = (user.failedAttempts || 0) + 1; if (user.failedAttempts >= 8) { user.lockedUntil = Date.now() + 120000; user.failedAttempts = 0; } }
+        return sendJson(response, 401, { error: "Username or password is incorrect." });
+      }
+      user.failedAttempts = 0; user.lockedUntil = 0;
+      const authToken = randomBytes(32).toString("base64url");
+      user.sessionHash = hashToken(authToken); user.sessionExpires = Date.now() + 30 * 86400000;
+      return sendJson(response, 200, { authToken, account: safeAccount(user) });
+    }
+    if (url.pathname === "/api/me" && request.method === "GET") {
+      const user = accountForRequest(request);
+      return user ? sendJson(response, 200, { account: safeAccount(user) }) : sendJson(response, 401, { error: "Sign in again to continue." });
+    }
+    if (url.pathname === "/api/logout" && request.method === "POST") {
+      const user = accountForRequest(request);
+      if (user) { user.sessionHash = ""; user.sessionExpires = 0; }
+      return sendJson(response, 200, { ok: true });
+    }
     if (url.pathname === "/api/create" && request.method === "POST") {
+      const account = accountForRequest(request);
+      if (!account) return sendJson(response, 401, { error: "Sign in before starting a heist." });
       const data = await readBody(request);
       let code;
       do { code = makeCode(); } while (rooms.has(code));
-      const player = createPlayer(data.name, true);
+      const player = createPlayer(account.displayName, true);
+      player.accountId = account.id;
       const room = {
-        code, phase: "lobby", round: 0, hostId: player.id, hostSeen: Date.now(),
+        code, phase: "lobby", round: 0, hostId: player.id, hostSeen: Date.now(), lastActivity: Date.now(),
         players: [player], stability: 6, score: 0, history: [], echoes: [],
         outcome: null, endsAt: 0, tutorialUsed: false, playerStats: {},
       };
@@ -452,14 +511,21 @@ async function handleRequest(request, response) {
       return sendJson(response, 200, { ...publicRoom(room, player.token), token: player.token });
     }
     if (url.pathname === "/api/join" && request.method === "POST") {
+      const account = accountForRequest(request);
+      if (!account) return sendJson(response, 401, { error: "Sign in before joining a heist." });
       const data = await readBody(request);
       const room = rooms.get(String(data.code || "").toUpperCase().replace(/[^A-Z0-9]/g, ""));
       if (!room) return sendJson(response, 404, { error: "Room not found. Check the four-letter code." });
-      let player = room.players.find((item) => item.token === data.token);
+      let player = room.players.find((item) => item.accountId === account.id);
+      if (!player && data.token) {
+        player = room.players.find((item) => item.token === data.token && !item.accountId);
+        if (player) player.accountId = account.id;
+      }
       if (!player) {
         if (room.phase !== "lobby") return sendJson(response, 403, { error: "This heist has started. Ask for the next room or replay." });
         if (room.players.length >= 8) return sendJson(response, 403, { error: "This crew is full (8 max)." });
-        player = createPlayer(data.name);
+        player = createPlayer(account.displayName);
+        player.accountId = account.id;
         room.players.push(player);
       }
       touch(room, player);
@@ -467,19 +533,29 @@ async function handleRequest(request, response) {
     }
     const match = url.pathname.match(/^\/api\/room\/([A-Z0-9]{4})$/);
     if (match) {
+      const account = accountForRequest(request);
+      if (!account) return sendJson(response, 401, { error: "Sign in before returning to your heist." });
       const room = rooms.get(match[1]);
       if (!room) return sendJson(response, 404, { error: "Room expired." });
       if (request.method === "GET") {
-        const token = url.searchParams.get("token");
-        const player = room.players.find((item) => item.token === token);
-        if (!player) return sendJson(response, 403, { error: "Rejoin token required." });
+        let player = room.players.find((item) => item.accountId === account.id);
+        if (!player) {
+          const legacyToken = url.searchParams.get("token");
+          player = room.players.find((item) => item.token === legacyToken && !item.accountId);
+          if (player) player.accountId = account.id;
+        }
+        if (!player) return sendJson(response, 403, { error: "You are not a member of this room. Join from the lobby." });
         touch(room, player);
-        return sendJson(response, 200, publicRoom(room, token));
+        return sendJson(response, 200, publicRoom(room, player.token));
       }
       if (request.method === "POST") {
         const data = await readBody(request);
-        const player = room.players.find((item) => item.token === data.token);
-        if (!player) return sendJson(response, 403, { error: "Bad token." });
+        let player = room.players.find((item) => item.accountId === account.id);
+        if (!player) {
+          player = room.players.find((item) => item.token === data.token && !item.accountId);
+          if (player) player.accountId = account.id;
+        }
+        if (!player) return sendJson(response, 403, { error: "You are not a member of this room." });
         touch(room, player);
         if (player.lastAction && Date.now() - player.lastAction < 140) return sendJson(response, 429, { error: "Your last move is still landing." });
         player.lastAction = Date.now();
@@ -530,14 +606,16 @@ function maintainRooms(now = Date.now()) {
       const next = room.players.filter((player) => now - player.seen < 90000).sort((a, b) => a.seen - b.seen)[0];
       if (next) { room.hostId = next.id; room.hostSeen = now; }
     }
-    if (!room.players.some((player) => now - player.seen < 90000)) rooms.delete(code);
+    const lastActivity = room.lastActivity || Math.max(0, ...room.players.map((player) => player.seen || 0));
+    if (now - lastActivity > 30 * 60 * 1000) rooms.delete(code);
   }
 }
 
-export { createPlayer, beginGame, beginLoop, resolve, finishGame, publicRoom, maintainRooms, rooms, handleRequest };
+export { createPlayer, beginGame, beginLoop, resolve, finishGame, publicRoom, maintainRooms, rooms, users, handleRequest };
 if (process.env.LOOPLINE_TEST !== "1" && process.env.VERCEL !== "1") {
   setInterval(maintainRooms, 500);
-  const port = Number(process.env.PORT || 3002);
+  const port = Number(process.env.PORT || 3001);
   server.listen(port, "0.0.0.0", () => console.log(`LOOPLINE online at http://localhost:${port}`));
 }
+
 

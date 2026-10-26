@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
 process.env.LOOPLINE_TEST = "1";
-const { rooms, handleRequest, maintainRooms } = await import("../server.mjs");
+const { rooms, users, handleRequest, maintainRooms } = await import("../server.mjs");
 const stateKey = "loopline:rooms:v1";
+const usersKey = "loopline:users:v1";
 const lockKey = "loopline:rooms:write-lock:v1";
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const json = (res, status, body) => {
@@ -11,8 +12,8 @@ const json = (res, status, body) => {
   res.end(JSON.stringify(body));
 };
 async function redis(...args) {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.UPSTASH_REDIS_REST_KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN;
   if (!url || !token) throw new Error("Connect an Upstash Redis database to this Vercel project first.");
   const response = await fetch(url, {
     method: "POST",
@@ -34,17 +35,26 @@ export default async function handler(req, res) {
     }
     if (!locked) return json(res, 503, { error: "The timeline is busy. Try again in a moment." });
 
-    const snapshot = await redis("GET", stateKey);
+    const [snapshot, savedUsers] = await Promise.all([redis("GET", stateKey), redis("GET", usersKey)]);
     rooms.clear();
+    users.clear();
     if (snapshot) {
       const savedRooms = JSON.parse(snapshot);
       for (const [code, room] of Object.entries(savedRooms)) rooms.set(code, room);
+    }
+    if (savedUsers) {
+      const parsedUsers = JSON.parse(savedUsers);
+      for (const [username, user] of Object.entries(parsedUsers)) users.set(username, user);
     }
     maintainRooms();
     await handleRequest(req, res);
     maintainRooms();
     const savedRooms = Object.fromEntries(rooms.entries());
-    await redis("SET", stateKey, JSON.stringify(savedRooms), "EX", "86400");
+    const persistedUsers = Object.fromEntries(users.entries());
+    await Promise.all([
+      redis("SET", stateKey, JSON.stringify(savedRooms), "EX", "86400"),
+      redis("SET", usersKey, JSON.stringify(persistedUsers), "EX", "31536000"),
+    ]);
   } catch (error) {
     if (!res.writableEnded) json(res, 503, { error: error.message || "Multiplayer storage is unavailable." });
   } finally {

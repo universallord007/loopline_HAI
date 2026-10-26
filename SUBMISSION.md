@@ -8,6 +8,6 @@
 
 **What makes runs vary:** Procedurally generated cores, safe time slices, private memories, bonus goals, and round rules. The third loop raises the stakes and doubles score.
 
-**Technical design:** Three.js space-vault backdrop, mobile-first HTML/CSS interface, server-authoritative Node.js game engine, 900 ms phase/state polling, four-character invite rooms, reconnect tokens, host reassignment, AFK resolution, and room expiry. For Vercel, an API function persists and serializes room updates through Upstash Redis.
+**Technical design:** Three.js space-vault backdrop, mobile-first HTML/CSS interface, server-authoritative Node.js game engine, 900 ms phase/state polling, four-character invite rooms, Redis-backed username/password accounts with no email or OAuth, hashed passwords and sessions, account-based seat recovery after refresh/rejoin, host reassignment, AFK resolution, and 30-minute room inactivity expiry. For Vercel, an API function persists and serializes room updates through Upstash Redis.
 
 **Run:** `npm start` from this directory, then open `http://localhost:3001`.
